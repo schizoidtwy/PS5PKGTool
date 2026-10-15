@@ -2,7 +2,7 @@ ProsperoPkgTool engine (clean-room reimplementation, MIT License)
 Copyright (c) 2026 pearlxcore
 
 Vendored managed library consumed by PS5PKGTool.Core.
-Source project: C:\Users\User\source\repos\ProsperoPkgTool
-Built: 2026-10-11 (Release, local working tree at 035c0e2; sparse-fidx-v1 reader plus removal of the fixed inner-PFS inode-count cap)
+Source project: https://github.com/schizoidtwy/ProsperoPkgTool (fork of pearlxcore/ProsperoPkgTool)
+Built: 2026-10-15 (Release, branch perf/outer-block-cache at 0a00fab = upstream f2c91cd + a cache of decrypted outer PFS blocks and a faster AES-XTS)
 Target: net10.0
-SHA-256 (ProsperoPkgTool.dll): C481C0B0C5E881709F8032BB916D35C087566611428C7E1BFDD764C0EDCB8535
+SHA-256 (ProsperoPkgTool.dll): A619CE4C74E70E46ADEC05429D33A6F1D4057DA0FDECE6478D0665DA75434ADF
