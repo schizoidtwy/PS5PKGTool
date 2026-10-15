@@ -201,7 +201,7 @@ public partial class MainForm
 
     private void menuLibraryExtractPackage_Click(object? sender, EventArgs e) => ExtractPackage(SelectedGame());
 
-    private void ExtractPackage(Ps5GameInfo? game)
+    private async void ExtractPackage(Ps5GameInfo? game)
     {
         if (game is null || game.SourceKind != Ps5SourceKind.SonyPackage || !File.Exists(game.RootPath))
         {
@@ -221,6 +221,7 @@ public partial class MainForm
             ? SonyDebugPackageCredentials.DefaultPasscode
             : _settings.DebugPasscode;
         IPackageBackend engine = ExtractBackend(_settings.ExtractBackend);
+        if (!await ConfirmExtractionSpaceAsync(source, destination, passcode)) return;
 
         SonyPackageExtractResult? outcome = null;
         EnqueueTask(PackageTaskTypes.PackageExtract, $"Extract {Path.GetFileName(source)}",
@@ -242,6 +243,49 @@ public partial class MainForm
                     statusLabel.Text = $"Package extraction {StatusText(task.Status).ToLowerInvariant()}.";
             });
         statusLabel.Text = "Queued: package extraction. See the Tasks tab.";
+    }
+
+    /// <summary>
+    /// Shows the disk space extracting <paramref name="source"/> needs next to the free space on the
+    /// destination volume and asks before queuing the extraction. Returns false when the user declines
+    /// or the files cannot fit. When the size cannot be read up front the extraction goes ahead and
+    /// reports any problem itself.
+    /// </summary>
+    private async Task<bool> ConfirmExtractionSpaceAsync(string source, string destination, string passcode)
+    {
+        ExtractionSpaceEstimate? space;
+        UseWaitCursor = true;
+        try
+        {
+            space = await Task.Run(() => ExtractionSpace.EstimatePackage(source, destination, passcode))
+                .ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            space = null;
+        }
+        finally
+        {
+            UseWaitCursor = false;
+        }
+        if (space is null) return true;
+
+        string free = space.AvailableBytes >= 0 ? ExtractionSpace.Format(space.AvailableBytes) : "unknown";
+        string summary = $"{Path.GetFileName(source)}\n\n" +
+                         $"Space needed: {ExtractionSpace.Format(space.RequiredBytes)} ({space.FileCount:N0} files)\n" +
+                         $"Free on {space.Volume}: {free}";
+        if (space.AvailableBytes >= 0 && space.DataBytes > space.AvailableBytes)
+        {
+            AppDialog.ShowWarning(summary + "\n\nThere is not enough free space for this extraction. " +
+                                  $"Free up at least {ExtractionSpace.Format(space.Shortfall)} or choose another folder.",
+                "Not enough disk space");
+            return false;
+        }
+        if (space.IsKnownNotToFit)
+            return AppDialog.ShowWarning(summary + "\n\nThe files may not fit once file system overhead is counted. " +
+                                         "Extract anyway?", "Low disk space", DarkDialogButton.YesNo) == DialogResult.Yes;
+        return AppDialog.ShowInformation(summary + "\n\nStart the extraction?", "Extract package",
+            DarkDialogButton.YesNo) == DialogResult.Yes;
     }
 
     // ---------------------------------------------------------------- move to folder

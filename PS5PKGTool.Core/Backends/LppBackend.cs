@@ -64,6 +64,8 @@ public sealed class LppBackend : IPackageBackend
         Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (ExtractionSpace.EstimatePackage(packagePath, destination, passcode) is { } space)
+                ExtractionSpace.ThrowIfNotEnoughSpace(space.DataBytes, destination);
             int files = LibProsperoPkg12.Extract(packagePath, destination, passcode);
             return new SonyPackageExtractResult
             {

@@ -54,6 +54,7 @@ public static class SonyPackageExtraction
 
             total = wanted.Sum(file => file.Size);
             fileCount = wanted.Length;
+            ExtractionSpace.ThrowIfNotEnoughSpace(total, staging);
 
             // Read in source order when the file system supports batch reads: each compressed block is
             // then decoded once and the package is scanned front to back, by several workers that each

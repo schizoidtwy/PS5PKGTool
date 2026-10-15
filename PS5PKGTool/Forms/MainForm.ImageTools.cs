@@ -730,7 +730,7 @@ public partial class MainForm
             ? _settings.DebugPasscode
             : SonyDebugPackageCredentials.DefaultPasscode;
 
-    private void RunPackageExtract()
+    private async void RunPackageExtract()
     {
         string source = _imageSourcePath!;
         string output = ImageOutputBox().Text.Trim();
@@ -742,6 +742,7 @@ public partial class MainForm
         if (Directory.Exists(output)) output = FindAvailableDirectory(output);
         string passcode = ImagePasscode();
         IPackageBackend engine = SelectedExtractBackend();
+        if (!await ConfirmExtractionSpaceAsync(source, output, passcode)) return;
         SonyPackageExtractResult? outcome = null;
         lblImageStatus.Text = "Queued: package extraction. See the Tasks tab.";
         EnqueueTask(PackageTaskTypes.PackageExtract, $"Extract {Path.GetFileName(source)}",
