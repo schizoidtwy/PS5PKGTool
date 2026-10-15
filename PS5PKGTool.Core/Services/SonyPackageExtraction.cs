@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Runtime.ExceptionServices;
+using System.Threading.Channels;
 using PS5PKGTool.Core.Builders;
 using PS5PKGTool.Core.Models;
 using PS5PKGTool.Core.Parsers;
@@ -51,27 +54,22 @@ public static class SonyPackageExtraction
 
             total = wanted.Sum(file => file.Size);
             fileCount = wanted.Length;
-            foreach (GameFileRecord file in wanted)
+
+            // Read in source order through one shared reader when the file system supports it: each
+            // compressed block is then decoded once and the package is scanned front to back. The
+            // order files are written in does not change the extracted tree.
+            IGameFileBatchReader? batch = null;
+            if (files is IBatchReadableGameFileSystem batchable)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                string relative = GameFileSystem.NormalizePath(file.RelativePath);
-                string target = ResolveContainedPath(staging, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-                await using var outputFile = new FileStream(target, FileMode.CreateNew, FileAccess.Write,
-                    FileShare.None, 1024 * 1024, FileOptions.Asynchronous);
-                await using Stream input = files.OpenRead(relative);
-                byte[] buffer = new byte[1024 * 1024];
-                long position = 0;
-                while (position < file.Size)
-                {
-                    int take = checked((int)Math.Min(buffer.Length, file.Size - position));
-                    int read = await input.ReadAsync(buffer.AsMemory(0, take), cancellationToken).ConfigureAwait(false);
-                    if (read <= 0) throw new EndOfStreamException($"Package file '{relative}' ended unexpectedly.");
-                    await outputFile.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-                    position += read;
-                    completed += read;
-                    progress?.Report(new SonyPackageExtractProgress(completed, total, relative));
-                }
+                wanted = batchable.OrderForSequentialRead(wanted);
+                batch = batchable.OpenBatchReader();
+            }
+
+            using (batch)
+            {
+                Func<string, Stream> openRead = batch is null ? files.OpenRead : batch.OpenRead;
+                completed = await CopyFilesAsync(wanted, staging, openRead, total, progress, cancellationToken)
+                    .ConfigureAwait(false);
             }
 
             Directory.Move(staging, output);
@@ -82,6 +80,152 @@ public static class SonyPackageExtraction
             try { if (Directory.Exists(staging)) Directory.Delete(staging, true); } catch (IOException) { }
             throw;
         }
+    }
+
+    private const int ChunkSize = 4 * 1024 * 1024;
+    private const int ChunkCount = 8;
+    private static readonly long ProgressInterval = Stopwatch.Frequency / 10;
+
+    /// <summary>One piece of a file in flight between the reader and the writer. An empty file is sent
+    /// as a single chunk with no buffer so the writer still creates it.</summary>
+    private readonly record struct Chunk(int FileIndex, byte[]? Buffer, int Count);
+
+    /// <summary>
+    /// Copies <paramref name="wanted"/> into <paramref name="root"/> with reading (decrypt +
+    /// decompress) and writing overlapped on two threads. A fixed set of buffers is recycled between
+    /// them, which bounds memory and makes the reader wait when the disk falls behind.
+    /// </summary>
+    private static async Task<long> CopyFilesAsync(GameFileRecord[] wanted, string root, Func<string, Stream> openRead,
+        long total, IProgress<SonyPackageExtractProgress>? progress, CancellationToken cancellationToken)
+    {
+        string[] relatives = wanted.Select(file => GameFileSystem.NormalizePath(file.RelativePath)).ToArray();
+        string[] targets = relatives.Select(relative => ResolveContainedPath(root, relative)).ToArray();
+
+        var free = Channel.CreateUnbounded<byte[]>();
+        for (int index = 0; index < ChunkCount; index++) free.Writer.TryWrite(new byte[ChunkSize]);
+        var filled = Channel.CreateBounded<Chunk>(new BoundedChannelOptions(ChunkCount)
+        {
+            SingleReader = true,
+            SingleWriter = true,
+        });
+
+        using var failure = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        CancellationToken token = failure.Token;
+
+        Task reader = Task.Run(async () =>
+        {
+            try
+            {
+                for (int fileIndex = 0; fileIndex < wanted.Length; fileIndex++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    long size = wanted[fileIndex].Size;
+                    if (size == 0)
+                    {
+                        await filled.Writer.WriteAsync(new Chunk(fileIndex, null, 0), token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    using Stream input = openRead(relatives[fileIndex]);
+                    long position = 0;
+                    while (position < size)
+                    {
+                        byte[] buffer = await free.Reader.ReadAsync(token).ConfigureAwait(false);
+                        int take = (int)Math.Min(buffer.Length, size - position);
+                        int count = 0;
+                        while (count < take)
+                        {
+                            int read = input.Read(buffer, count, take - count);
+                            if (read <= 0)
+                                throw new EndOfStreamException($"Package file '{relatives[fileIndex]}' ended unexpectedly.");
+                            count += read;
+                        }
+                        position += count;
+                        await filled.Writer.WriteAsync(new Chunk(fileIndex, buffer, count), token).ConfigureAwait(false);
+                    }
+                }
+                filled.Writer.Complete();
+            }
+            catch (Exception ex)
+            {
+                filled.Writer.TryComplete(ex);
+                failure.Cancel();
+                throw;
+            }
+        }, token);
+
+        Task<long> writer = Task.Run(async () =>
+        {
+            var createdDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            FileStream? output = null;
+            int currentFile = -1;
+            long completed = 0;
+            long lastReport = 0;
+            try
+            {
+                await foreach (Chunk chunk in filled.Reader.ReadAllAsync(token).ConfigureAwait(false))
+                {
+                    if (chunk.FileIndex != currentFile)
+                    {
+                        output?.Dispose();
+                        output = null;
+                        currentFile = chunk.FileIndex;
+                        string target = targets[currentFile];
+                        string directory = Path.GetDirectoryName(target)!;
+                        if (createdDirectories.Add(directory)) Directory.CreateDirectory(directory);
+                        output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                            bufferSize: 0, FileOptions.None);
+                        // Reserving the final size up front lets NTFS allocate one contiguous run
+                        // instead of growing the file a chunk at a time.
+                        if (wanted[currentFile].Size > 0) output.SetLength(wanted[currentFile].Size);
+                    }
+
+                    if (chunk.Buffer is not null)
+                    {
+                        output!.Write(chunk.Buffer, 0, chunk.Count);
+                        completed += chunk.Count;
+                        free.Writer.TryWrite(chunk.Buffer);
+                    }
+
+                    long now = Stopwatch.GetTimestamp();
+                    if (progress is not null && now - lastReport >= ProgressInterval)
+                    {
+                        lastReport = now;
+                        progress.Report(new SonyPackageExtractProgress(completed, total, relatives[currentFile]));
+                    }
+                }
+                output?.Dispose();
+                output = null;
+                if (progress is not null && currentFile >= 0)
+                    progress.Report(new SonyPackageExtractProgress(completed, total, relatives[currentFile]));
+                return completed;
+            }
+            catch
+            {
+                failure.Cancel();
+                throw;
+            }
+            finally
+            {
+                output?.Dispose();
+            }
+        }, token);
+
+        try
+        {
+            await Task.WhenAll(reader, writer).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Surface the root cause rather than the cancellation it triggered on the other side.
+            Exception? cause = new[] { reader.Exception, writer.Exception }
+                .SelectMany(aggregate => aggregate?.InnerExceptions ?? [])
+                .FirstOrDefault(ex => ex is not OperationCanceledException);
+            if (cause is not null) ExceptionDispatchInfo.Throw(cause);
+            cancellationToken.ThrowIfCancellationRequested();
+            throw;
+        }
+        return writer.Result;
     }
 
     private static string ResolveContainedPath(string root, string relative)

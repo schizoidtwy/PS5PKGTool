@@ -33,6 +33,7 @@ internal static class SonyPfsEntryDataReader
             FileShare.ReadWrite | FileShare.Delete, 64 * 1024, FileOptions.RandomAccess);
         int written = 0;
         long skip = offset;
+        byte[]? block = null;
         foreach (SonyPfsExtent extent in entry.Extents)
         {
             if (skip >= extent.Length) { skip -= extent.Length; continue; }
@@ -56,7 +57,7 @@ internal static class SonyPfsEntryDataReader
                 }
                 else
                 {
-                    byte[] block = new byte[image.CryptoContext.BlockSize];
+                    block ??= new byte[image.CryptoContext.BlockSize];
                     stream.Position = absolute;
                     stream.ReadExactly(block);
                     SonyPfsCrypto.DecryptBlock(block, image.CryptoContext, checked((ulong)relativeBlock),

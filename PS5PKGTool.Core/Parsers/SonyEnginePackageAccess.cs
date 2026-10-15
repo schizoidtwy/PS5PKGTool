@@ -15,6 +15,7 @@ internal sealed class SonyEnginePackageAccess : IDisposable
     private readonly string _passcode;
     private readonly string _contentId;
     private IReadOnlyList<ProsperoInnerPfsReader.Entry>? _entries;
+    private Dictionary<string, ProsperoInnerPfsReader.Entry>? _fileIndex;
     private ProsperoDecodedPackage? _decoded;
     private ProsperoFileBackedPackage? _fileBacked;
     private string? _decodeError;
@@ -253,19 +254,19 @@ internal sealed class SonyEnginePackageAccess : IDisposable
 
     public bool TryFindFile(string relativePath, out ProsperoInnerPfsReader.Entry entry)
     {
-        string key = Normalize(relativePath);
-        foreach (ProsperoInnerPfsReader.Entry candidate in Entries)
-        {
-            if (!candidate.IsDirectory &&
-                string.Equals(Normalize(candidate.Path), key, StringComparison.OrdinalIgnoreCase))
-            {
-                entry = candidate;
-                return true;
-            }
-        }
+        // Lookups run once per file during extraction, so a linear scan over every entry made a full
+        // extract quadratic in the file count. The index is built once from the decoded entry list.
+        Dictionary<string, ProsperoInnerPfsReader.Entry> index = LazyInitializer.EnsureInitialized(ref _fileIndex, BuildFileIndex);
+        return index.TryGetValue(Normalize(relativePath), out entry!);
+    }
 
-        entry = null!;
-        return false;
+    private Dictionary<string, ProsperoInnerPfsReader.Entry> BuildFileIndex()
+    {
+        var index = new Dictionary<string, ProsperoInnerPfsReader.Entry>(StringComparer.OrdinalIgnoreCase);
+        // TryAdd keeps the first match, the same entry the previous linear scan returned.
+        foreach (ProsperoInnerPfsReader.Entry candidate in Entries)
+            if (!candidate.IsDirectory) index.TryAdd(Normalize(candidate.Path), candidate);
+        return index;
     }
 
     public byte[] ReadFile(ProsperoInnerPfsReader.Entry entry)
@@ -301,6 +302,22 @@ internal sealed class SonyEnginePackageAccess : IDisposable
     {
         if (entry.IsDirectory) throw new InvalidDataException($"'{entry.Path}' is a directory.");
         return new BoundedStream(OpenMount(), entry.LogicalOffset, entry.Size);
+    }
+
+    /// <summary>
+    /// Opens one mount for reading many files in a row. The engine's mount stream caches the last
+    /// decoded (decrypted + Kraken-decompressed) block, so reusing a single mount and reading files
+    /// in <see cref="ProsperoInnerPfsReader.Entry.LogicalOffset"/> order decodes each block once
+    /// instead of once per file that touches it. Not safe for concurrent readers.
+    /// </summary>
+    public Stream OpenSharedMount() => OpenMount();
+
+    /// <summary>Opens <paramref name="entry"/> over a mount from <see cref="OpenSharedMount"/>; disposing
+    /// the returned stream leaves the shared mount open.</summary>
+    public Stream OpenInnerFile(ProsperoInnerPfsReader.Entry entry, Stream sharedMount)
+    {
+        if (entry.IsDirectory) throw new InvalidDataException($"'{entry.Path}' is a directory.");
+        return new BoundedStream(sharedMount, entry.LogicalOffset, entry.Size, leaveOpen: true);
     }
 
     private Stream OpenMount()
@@ -426,14 +443,16 @@ internal sealed class SonyEnginePackageAccess : IDisposable
         private readonly Stream _inner;
         private readonly long _start;
         private readonly long _length;
+        private readonly bool _leaveOpen;
         private long _position;
 
-        public BoundedStream(Stream inner, long start, long length)
+        public BoundedStream(Stream inner, long start, long length, bool leaveOpen = false)
         {
             if (start < 0 || length < 0) throw new ArgumentOutOfRangeException(nameof(start));
             _inner = inner;
             _start = start;
             _length = length;
+            _leaveOpen = leaveOpen;
         }
 
         public override bool CanRead => true;
@@ -471,6 +490,6 @@ internal sealed class SonyEnginePackageAccess : IDisposable
 
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-        protected override void Dispose(bool disposing) { if (disposing) _inner.Dispose(); base.Dispose(disposing); }
+        protected override void Dispose(bool disposing) { if (disposing && !_leaveOpen) _inner.Dispose(); base.Dispose(disposing); }
     }
 }

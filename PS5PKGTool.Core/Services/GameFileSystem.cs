@@ -20,6 +20,23 @@ public interface IReadOnlyGameFileSystem : IDisposable
     Stream OpenRead(string relativePath);
 }
 
+/// <summary>
+/// Optional fast path for reading many files in one pass (extraction). Files are ordered by where
+/// their data lives in the source, and a batch reader shares one underlying source across them, so
+/// a full read becomes a near-sequential scan instead of a reopen-and-seek per file.
+/// </summary>
+internal interface IBatchReadableGameFileSystem
+{
+    GameFileRecord[] OrderForSequentialRead(IEnumerable<GameFileRecord> files);
+    IGameFileBatchReader OpenBatchReader();
+}
+
+/// <summary>Opens files over a shared source. Streams must be read one at a time, not concurrently.</summary>
+internal interface IGameFileBatchReader : IDisposable
+{
+    Stream OpenRead(string relativePath);
+}
+
 public static class GameFileSystem
 {
     public static IReadOnlyGameFileSystem Open(Ps5GameInfo game, CancellationToken cancellationToken = default) =>
@@ -107,7 +124,7 @@ public static class GameFileSystem
         return new GameFileChunk(data, offset, input.Length);
     }
 
-    private sealed class SonyPackageGameFileSystem : IReadOnlyGameFileSystem
+    private sealed class SonyPackageGameFileSystem : IReadOnlyGameFileSystem, IBatchReadableGameFileSystem
     {
         private readonly string _path;
         private readonly Dictionary<string, Segment[]> _segments;
@@ -244,9 +261,51 @@ public static class GameFileSystem
             }
             if (!_segments.TryGetValue(normalized, out Segment[]? segments))
                 throw new FileNotFoundException("The selected package file was not found or is encrypted.", normalized);
-            var source = new FileStream(_path, FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete, 1024 * 1024, FileOptions.RandomAccess);
-            return new SegmentedReadStream(source, segments, _cryptoContext);
+            return new SegmentedReadStream(OpenPackageFile(), segments, _cryptoContext);
+        }
+
+        private FileStream OpenPackageFile() => new(_path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, 1024 * 1024, FileOptions.RandomAccess);
+
+        public GameFileRecord[] OrderForSequentialRead(IEnumerable<GameFileRecord> files) =>
+            files.OrderBy(file => SourceOffset(NormalizePath(file.RelativePath)))
+                .ThenBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+        // CNT entries are small, decoded in memory, and not part of the inner image, so they sort last.
+        private long SourceOffset(string normalized)
+        {
+            if (_engine is not null)
+                return _engine.TryFindFile(normalized, out ProsperoInnerPfsReader.Entry entry) ? entry.LogicalOffset : long.MaxValue;
+            return _segments.TryGetValue(normalized, out Segment[]? segments) && segments.Length > 0
+                ? segments[0].Offset
+                : long.MaxValue;
+        }
+
+        public IGameFileBatchReader OpenBatchReader() => new BatchReader(this);
+
+        private sealed class BatchReader(SonyPackageGameFileSystem owner) : IGameFileBatchReader
+        {
+            // Opened on first use, so a batch made only of CNT entries never decodes a mount.
+            private Stream? _source;
+
+            public Stream OpenRead(string relativePath)
+            {
+                string normalized = NormalizePath(relativePath);
+                if (owner._engine is { } engine)
+                {
+                    if (!engine.TryFindFile(normalized, out ProsperoInnerPfsReader.Entry entry))
+                        return owner.OpenRead(normalized);
+                    _source ??= engine.OpenSharedMount();
+                    return engine.OpenInnerFile(entry, _source);
+                }
+                if (!owner._segments.TryGetValue(normalized, out Segment[]? segments))
+                    return owner.OpenRead(normalized);
+                _source ??= owner.OpenPackageFile();
+                return new SegmentedReadStream(_source, segments, owner._cryptoContext, leaveOpen: true);
+            }
+
+            public void Dispose() => _source?.Dispose();
         }
 
         // The engine access is shared/cached, so it is not disposed here; releasing its file handle
@@ -263,15 +322,18 @@ public static class GameFileSystem
         private readonly Segment[] _segments;
         private readonly long[] _starts;
         private readonly SonyPfsCryptoContext? _cryptoContext;
+        private readonly bool _leaveOpen;
         private byte[]? _decryptedBlock;
         private int _cachedSegmentIndex = -1;
         private long _position;
 
-        public SegmentedReadStream(Stream source, Segment[] segments, SonyPfsCryptoContext? cryptoContext = null)
+        public SegmentedReadStream(Stream source, Segment[] segments, SonyPfsCryptoContext? cryptoContext = null,
+            bool leaveOpen = false)
         {
             _source = source;
             _segments = segments;
             _cryptoContext = cryptoContext;
+            _leaveOpen = leaveOpen;
             _starts = new long[segments.Length];
             long length = 0;
             for (int index = 0; index < segments.Length; index++)
@@ -356,7 +418,7 @@ public static class GameFileSystem
 
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-        protected override void Dispose(bool disposing) { if (disposing) _source.Dispose(); base.Dispose(disposing); }
+        protected override void Dispose(bool disposing) { if (disposing && !_leaveOpen) _source.Dispose(); base.Dispose(disposing); }
     }
 
     private sealed class LocalGameFileSystem : IReadOnlyGameFileSystem

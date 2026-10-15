@@ -1,4 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using PS5PKGTool.Core.Models;
@@ -46,28 +49,70 @@ internal static class SonyPfsCrypto
         ulong blockIndex, bool signedDomain)
         => TransformBlock(block, context, blockIndex, signedDomain, encrypt: true);
 
+    /// <summary>AES instances for a context, created once instead of per block. Instance members of
+    /// <see cref="Aes"/> are not documented as thread-safe, so each use takes the lock.</summary>
+    private sealed class Ciphers(byte[] dataKey, byte[] tweakKey)
+    {
+        public readonly Aes Data = CreateAes(dataKey);
+        public readonly Aes Tweak = CreateAes(tweakKey);
+    }
+
+    private static readonly ConditionalWeakTable<SonyPfsCryptoContext, Ciphers> CipherCache = new();
+
     private static void TransformBlock(Span<byte> block, SonyPfsCryptoContext context,
         ulong blockIndex, bool signedDomain, bool encrypt)
     {
         if ((block.Length & 15) != 0) throw new InvalidDataException("An AES XTS block must be 16-byte aligned.");
-        using Aes dataAes = CreateAes(context.DataKey);
-        using Aes tweakAes = CreateAes(context.TweakKey);
-        using ICryptoTransform dataTransform = encrypt ? dataAes.CreateEncryptor() : dataAes.CreateDecryptor();
-        using ICryptoTransform tweakEncryptor = tweakAes.CreateEncryptor();
-        byte[] tweakInput = new byte[16];
+        Ciphers ciphers = CipherCache.GetValue(context, static value => new Ciphers(value.DataKey, value.TweakKey));
+
+        Span<byte> tweakInput = stackalloc byte[16];
+        tweakInput.Clear();
         BinaryPrimitives.WriteUInt64LittleEndian(tweakInput,
             signedDomain ? blockIndex | SignedSectorFlag : blockIndex);
-        byte[] tweak = new byte[16];
-        tweakEncryptor.TransformBlock(tweakInput, 0, 16, tweak, 0);
-        byte[] temporary = new byte[16];
-        byte[] transformed = new byte[16];
-        for (int offset = 0; offset < block.Length; offset += 16)
+        Span<byte> tweak = stackalloc byte[16];
+        lock (ciphers) ciphers.Tweak.EncryptEcb(tweakInput, tweak, PaddingMode.None);
+
+        // Expand the whole tweak sequence up front (multiply by x in GF(2^128) per 16-byte unit), so
+        // the data pass is XOR, one ECB call over the block, XOR, instead of one transform per unit.
+        byte[] scratch = ArrayPool<byte>.Shared.Rent(block.Length * 2);
+        try
         {
-            for (int index = 0; index < 16; index++) temporary[index] = (byte)(block[offset + index] ^ tweak[index]);
-            dataTransform.TransformBlock(temporary, 0, 16, transformed, 0);
-            for (int index = 0; index < 16; index++) block[offset + index] = (byte)(transformed[index] ^ tweak[index]);
-            MultiplyTweak(tweak);
+            Span<byte> tweaks = scratch.AsSpan(0, block.Length);
+            Span<byte> buffer = scratch.AsSpan(block.Length, block.Length);
+            ulong low = BinaryPrimitives.ReadUInt64LittleEndian(tweak);
+            ulong high = BinaryPrimitives.ReadUInt64LittleEndian(tweak[8..]);
+            for (int offset = 0; offset < tweaks.Length; offset += 16)
+            {
+                BinaryPrimitives.WriteUInt64LittleEndian(tweaks[offset..], low);
+                BinaryPrimitives.WriteUInt64LittleEndian(tweaks[(offset + 8)..], high);
+                ulong carry = high >> 63;
+                high = (high << 1) | (low >> 63);
+                low = (low << 1) ^ (carry * 0x87);
+            }
+
+            Xor(block, tweaks, buffer);
+            lock (ciphers)
+            {
+                if (encrypt) ciphers.Data.EncryptEcb(buffer, block, PaddingMode.None);
+                else ciphers.Data.DecryptEcb(buffer, block, PaddingMode.None);
+            }
+            Xor(block, tweaks, block);
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(scratch);
+        }
+    }
+
+    private static void Xor(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right, Span<byte> destination)
+    {
+        int index = 0;
+        if (Vector.IsHardwareAccelerated)
+        {
+            for (; index <= left.Length - Vector<byte>.Count; index += Vector<byte>.Count)
+                (new Vector<byte>(left[index..]) ^ new Vector<byte>(right[index..])).CopyTo(destination[index..]);
+        }
+        for (; index < left.Length; index++) destination[index] = (byte)(left[index] ^ right[index]);
     }
 
     private static Aes CreateAes(byte[] key)
@@ -79,17 +124,5 @@ internal static class SonyPfsCrypto
         aes.BlockSize = 128;
         aes.Key = key;
         return aes;
-    }
-
-    private static void MultiplyTweak(Span<byte> tweak)
-    {
-        int carry = 0;
-        for (int index = 0; index < tweak.Length; index++)
-        {
-            int next = tweak[index] >> 7;
-            tweak[index] = (byte)((tweak[index] << 1) | carry);
-            carry = next;
-        }
-        if (carry != 0) tweak[0] ^= 0x87;
     }
 }
