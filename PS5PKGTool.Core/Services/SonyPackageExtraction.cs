@@ -1,6 +1,6 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
-using System.Threading.Channels;
 using PS5PKGTool.Core.Builders;
 using PS5PKGTool.Core.Models;
 using PS5PKGTool.Core.Parsers;
@@ -55,22 +55,25 @@ public static class SonyPackageExtraction
             total = wanted.Sum(file => file.Size);
             fileCount = wanted.Length;
 
-            // Read in source order through one shared reader when the file system supports it: each
-            // compressed block is then decoded once and the package is scanned front to back. The
-            // order files are written in does not change the extracted tree.
-            IGameFileBatchReader? batch = null;
+            // Read in source order when the file system supports batch reads: each compressed block is
+            // then decoded once and the package is scanned front to back, by several workers that each
+            // own a reader. The order files are written in does not change the extracted tree.
+            Func<IGameFileBatchReader> openReader;
+            int workers;
             if (files is IBatchReadableGameFileSystem batchable)
             {
                 wanted = batchable.OrderForSequentialRead(wanted);
-                batch = batchable.OpenBatchReader();
+                openReader = batchable.OpenBatchReader;
+                workers = Math.Clamp(Environment.ProcessorCount, 2, MaxWorkers);
+            }
+            else
+            {
+                openReader = () => new DirectReader(files);
+                workers = 1;
             }
 
-            using (batch)
-            {
-                Func<string, Stream> openRead = batch is null ? files.OpenRead : batch.OpenRead;
-                completed = await CopyFilesAsync(wanted, staging, openRead, total, progress, cancellationToken)
-                    .ConfigureAwait(false);
-            }
+            completed = await CopyFilesAsync(wanted, staging, openReader, workers, total, progress, cancellationToken)
+                .ConfigureAwait(false);
 
             Directory.Move(staging, output);
             return new SonyPackageExtractResult { Destination = output, FileCount = fileCount, ExtractedBytes = completed };
@@ -82,150 +85,178 @@ public static class SonyPackageExtraction
         }
     }
 
-    private const int ChunkSize = 4 * 1024 * 1024;
-    private const int ChunkCount = 8;
+    // Decoding (outer AES-XTS + Kraken) is CPU-bound and single-threaded per mount, so extraction
+    // scales with workers that each own a mount; past ~8 the disk is usually the limit.
+    private const int MaxWorkers = 8;
+    private const long UnitBytes = 32 * 1024 * 1024;
+    private const int BufferSize = 4 * 1024 * 1024;
     private static readonly long ProgressInterval = Stopwatch.Frequency / 10;
 
-    /// <summary>One piece of a file in flight between the reader and the writer. An empty file is sent
-    /// as a single chunk with no buffer so the writer still creates it.</summary>
-    private readonly record struct Chunk(int FileIndex, byte[]? Buffer, int Count);
+    /// <summary>
+    /// A slice of work in source order: whole files <c>First .. First + Count - 1</c>, or, when
+    /// <see cref="RangeLength"/> is not negative, one range of a single large file so that a big file
+    /// is decoded by several workers at once.
+    /// </summary>
+    private readonly record struct WorkUnit(int First, int Count, long RangeStart = 0, long RangeLength = -1);
 
     /// <summary>
-    /// Copies <paramref name="wanted"/> into <paramref name="root"/> with reading (decrypt +
-    /// decompress) and writing overlapped on two threads. A fixed set of buffers is recycled between
-    /// them, which bounds memory and makes the reader wait when the disk falls behind.
+    /// Copies <paramref name="wanted"/> (already in source order) into <paramref name="root"/>.
+    /// Workers take ~32 MiB units in order, so together they still sweep the package front to back,
+    /// and each reads and writes its own units, which overlaps decoding with disk writes.
     /// </summary>
-    private static async Task<long> CopyFilesAsync(GameFileRecord[] wanted, string root, Func<string, Stream> openRead,
-        long total, IProgress<SonyPackageExtractProgress>? progress, CancellationToken cancellationToken)
+    private static async Task<long> CopyFilesAsync(GameFileRecord[] wanted, string root,
+        Func<IGameFileBatchReader> openReader, int workers, long total,
+        IProgress<SonyPackageExtractProgress>? progress, CancellationToken cancellationToken)
     {
         string[] relatives = wanted.Select(file => GameFileSystem.NormalizePath(file.RelativePath)).ToArray();
         string[] targets = relatives.Select(relative => ResolveContainedPath(root, relative)).ToArray();
+        WorkUnit[] units = PlanUnits(wanted);
+        workers = Math.Max(1, Math.Min(workers, units.Length));
 
-        var free = Channel.CreateUnbounded<byte[]>();
-        for (int index = 0; index < ChunkCount; index++) free.Writer.TryWrite(new byte[ChunkSize]);
-        var filled = Channel.CreateBounded<Chunk>(new BoundedChannelOptions(ChunkCount)
-        {
-            SingleReader = true,
-            SingleWriter = true,
-        });
+        var createdDirectories = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        long completed = 0;
+        long lastReport = 0;
+        int nextUnit = -1;
 
         using var failure = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         CancellationToken token = failure.Token;
 
-        Task reader = Task.Run(async () =>
+        void ReportProgress(int fileIndex, bool force)
+        {
+            if (progress is null) return;
+            long now = Stopwatch.GetTimestamp();
+            long last = Interlocked.Read(ref lastReport);
+            if (!force && (now - last < ProgressInterval || Interlocked.CompareExchange(ref lastReport, now, last) != last))
+                return;
+            progress.Report(new SonyPackageExtractProgress(Interlocked.Read(ref completed), total, relatives[fileIndex]));
+        }
+
+        void CopyRange(IGameFileBatchReader reader, int fileIndex, long start, long length, byte[] buffer)
+        {
+            string target = targets[fileIndex];
+            string directory = Path.GetDirectoryName(target)!;
+            // Create before recording it, so another worker never sees a directory that is not there yet.
+            if (!createdDirectories.ContainsKey(directory))
+            {
+                Directory.CreateDirectory(directory);
+                createdDirectories.TryAdd(directory, 0);
+            }
+
+            long size = wanted[fileIndex].Size;
+            // Ranges of one large file are written by several workers through their own handles. The
+            // staging folder is new, so OpenOrCreate never meets a file this run did not make.
+            using var output = new FileStream(target, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite,
+                bufferSize: 0, FileOptions.None);
+            // Reserving the final size up front lets NTFS allocate the file once instead of growing it.
+            if (size > 0 && output.Length != size) output.SetLength(size);
+            if (length == 0) return;
+
+            using Stream input = reader.OpenRead(relatives[fileIndex]);
+            input.Position = start;
+            output.Position = start;
+            long done = 0;
+            while (done < length)
+            {
+                token.ThrowIfCancellationRequested();
+                int take = (int)Math.Min(buffer.Length, length - done);
+                int count = 0;
+                while (count < take)
+                {
+                    int read = input.Read(buffer, count, take - count);
+                    if (read <= 0)
+                        throw new EndOfStreamException($"Package file '{relatives[fileIndex]}' ended unexpectedly.");
+                    count += read;
+                }
+                output.Write(buffer, 0, count);
+                done += count;
+                Interlocked.Add(ref completed, count);
+                ReportProgress(fileIndex, force: false);
+            }
+        }
+
+        Task[] tasks = Enumerable.Range(0, workers).Select(_ => Task.Run(() =>
         {
             try
             {
-                for (int fileIndex = 0; fileIndex < wanted.Length; fileIndex++)
+                using IGameFileBatchReader reader = openReader();
+                byte[] buffer = new byte[BufferSize];
+                while (true)
                 {
                     token.ThrowIfCancellationRequested();
-                    long size = wanted[fileIndex].Size;
-                    if (size == 0)
+                    int index = Interlocked.Increment(ref nextUnit);
+                    if (index >= units.Length) return;
+                    WorkUnit unit = units[index];
+                    for (int fileIndex = unit.First; fileIndex < unit.First + unit.Count; fileIndex++)
                     {
-                        await filled.Writer.WriteAsync(new Chunk(fileIndex, null, 0), token).ConfigureAwait(false);
-                        continue;
-                    }
-
-                    using Stream input = openRead(relatives[fileIndex]);
-                    long position = 0;
-                    while (position < size)
-                    {
-                        byte[] buffer = await free.Reader.ReadAsync(token).ConfigureAwait(false);
-                        int take = (int)Math.Min(buffer.Length, size - position);
-                        int count = 0;
-                        while (count < take)
-                        {
-                            int read = input.Read(buffer, count, take - count);
-                            if (read <= 0)
-                                throw new EndOfStreamException($"Package file '{relatives[fileIndex]}' ended unexpectedly.");
-                            count += read;
-                        }
-                        position += count;
-                        await filled.Writer.WriteAsync(new Chunk(fileIndex, buffer, count), token).ConfigureAwait(false);
+                        bool whole = unit.RangeLength < 0;
+                        CopyRange(reader, fileIndex, whole ? 0 : unit.RangeStart,
+                            whole ? wanted[fileIndex].Size : unit.RangeLength, buffer);
                     }
                 }
-                filled.Writer.Complete();
-            }
-            catch (Exception ex)
-            {
-                filled.Writer.TryComplete(ex);
-                failure.Cancel();
-                throw;
-            }
-        }, token);
-
-        Task<long> writer = Task.Run(async () =>
-        {
-            var createdDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            FileStream? output = null;
-            int currentFile = -1;
-            long completed = 0;
-            long lastReport = 0;
-            try
-            {
-                await foreach (Chunk chunk in filled.Reader.ReadAllAsync(token).ConfigureAwait(false))
-                {
-                    if (chunk.FileIndex != currentFile)
-                    {
-                        output?.Dispose();
-                        output = null;
-                        currentFile = chunk.FileIndex;
-                        string target = targets[currentFile];
-                        string directory = Path.GetDirectoryName(target)!;
-                        if (createdDirectories.Add(directory)) Directory.CreateDirectory(directory);
-                        output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                            bufferSize: 0, FileOptions.None);
-                        // Reserving the final size up front lets NTFS allocate one contiguous run
-                        // instead of growing the file a chunk at a time.
-                        if (wanted[currentFile].Size > 0) output.SetLength(wanted[currentFile].Size);
-                    }
-
-                    if (chunk.Buffer is not null)
-                    {
-                        output!.Write(chunk.Buffer, 0, chunk.Count);
-                        completed += chunk.Count;
-                        free.Writer.TryWrite(chunk.Buffer);
-                    }
-
-                    long now = Stopwatch.GetTimestamp();
-                    if (progress is not null && now - lastReport >= ProgressInterval)
-                    {
-                        lastReport = now;
-                        progress.Report(new SonyPackageExtractProgress(completed, total, relatives[currentFile]));
-                    }
-                }
-                output?.Dispose();
-                output = null;
-                if (progress is not null && currentFile >= 0)
-                    progress.Report(new SonyPackageExtractProgress(completed, total, relatives[currentFile]));
-                return completed;
             }
             catch
             {
                 failure.Cancel();
                 throw;
             }
-            finally
-            {
-                output?.Dispose();
-            }
-        }, token);
+        }, token)).ToArray();
 
         try
         {
-            await Task.WhenAll(reader, writer).ConfigureAwait(false);
+            await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         catch
         {
-            // Surface the root cause rather than the cancellation it triggered on the other side.
-            Exception? cause = new[] { reader.Exception, writer.Exception }
-                .SelectMany(aggregate => aggregate?.InnerExceptions ?? [])
+            // Surface the root cause rather than the cancellations it triggered in the other workers.
+            Exception? cause = tasks
+                .SelectMany(task => task.Exception?.InnerExceptions ?? [])
                 .FirstOrDefault(ex => ex is not OperationCanceledException);
             if (cause is not null) ExceptionDispatchInfo.Throw(cause);
             cancellationToken.ThrowIfCancellationRequested();
             throw;
         }
-        return writer.Result;
+
+        ReportProgress(wanted.Length - 1, force: true);
+        return completed;
+    }
+
+    /// <summary>Groups consecutive small files into ~<see cref="UnitBytes"/> units and splits files
+    /// larger than that into ranges, keeping source order.</summary>
+    private static WorkUnit[] PlanUnits(GameFileRecord[] wanted)
+    {
+        var units = new List<WorkUnit>();
+        int groupStart = 0;
+        long groupBytes = 0;
+        for (int index = 0; index < wanted.Length; index++)
+        {
+            long size = wanted[index].Size;
+            if (size > UnitBytes)
+            {
+                if (index > groupStart) units.Add(new WorkUnit(groupStart, index - groupStart));
+                for (long start = 0; start < size; start += UnitBytes)
+                    units.Add(new WorkUnit(index, 1, start, Math.Min(UnitBytes, size - start)));
+                groupStart = index + 1;
+                groupBytes = 0;
+                continue;
+            }
+
+            groupBytes += size;
+            if (groupBytes >= UnitBytes)
+            {
+                units.Add(new WorkUnit(groupStart, index + 1 - groupStart));
+                groupStart = index + 1;
+                groupBytes = 0;
+            }
+        }
+        if (groupStart < wanted.Length) units.Add(new WorkUnit(groupStart, wanted.Length - groupStart));
+        return units.ToArray();
+    }
+
+    /// <summary>Fallback for file systems without batch reads: plain per-file opens, one worker.</summary>
+    private sealed class DirectReader(IReadOnlyGameFileSystem files) : IGameFileBatchReader
+    {
+        public Stream OpenRead(string relativePath) => files.OpenRead(relativePath);
+        public void Dispose() { }
     }
 
     private static string ResolveContainedPath(string root, string relative)

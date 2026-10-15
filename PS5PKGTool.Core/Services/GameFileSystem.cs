@@ -23,7 +23,8 @@ public interface IReadOnlyGameFileSystem : IDisposable
 /// <summary>
 /// Optional fast path for reading many files in one pass (extraction). Files are ordered by where
 /// their data lives in the source, and a batch reader shares one underlying source across them, so
-/// a full read becomes a near-sequential scan instead of a reopen-and-seek per file.
+/// a full read becomes a near-sequential scan instead of a reopen-and-seek per file. Each batch
+/// reader owns its source, so several readers can be used in parallel, one thread per reader.
 /// </summary>
 internal interface IBatchReadableGameFileSystem
 {
@@ -31,7 +32,8 @@ internal interface IBatchReadableGameFileSystem
     IGameFileBatchReader OpenBatchReader();
 }
 
-/// <summary>Opens files over a shared source. Streams must be read one at a time, not concurrently.</summary>
+/// <summary>Opens files over a source owned by this reader. Streams from one reader must be read
+/// one at a time; separate readers are independent.</summary>
 internal interface IGameFileBatchReader : IDisposable
 {
     Stream OpenRead(string relativePath);
@@ -296,7 +298,7 @@ public static class GameFileSystem
                 {
                     if (!engine.TryFindFile(normalized, out ProsperoInnerPfsReader.Entry entry))
                         return owner.OpenRead(normalized);
-                    _source ??= engine.OpenSharedMount();
+                    _source ??= engine.OpenIndependentMount();
                     return engine.OpenInnerFile(entry, _source);
                 }
                 if (!owner._segments.TryGetValue(normalized, out Segment[]? segments))

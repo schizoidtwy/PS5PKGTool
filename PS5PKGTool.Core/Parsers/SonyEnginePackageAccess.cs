@@ -305,15 +305,33 @@ internal sealed class SonyEnginePackageAccess : IDisposable
     }
 
     /// <summary>
-    /// Opens one mount for reading many files in a row. The engine's mount stream caches the last
-    /// decoded (decrypted + Kraken-decompressed) block, so reusing a single mount and reading files
-    /// in <see cref="ProsperoInnerPfsReader.Entry.LogicalOffset"/> order decodes each block once
-    /// instead of once per file that touches it. Not safe for concurrent readers.
+    /// Opens a mount with its own package handle for reading many files in a row. The engine's
+    /// mount stream caches the last decoded (decrypted + Kraken-decompressed) block, so reading files
+    /// in <see cref="ProsperoInnerPfsReader.Entry.LogicalOffset"/> order through one mount decodes
+    /// each block once. A file-backed package shares one file stream across its mounts, so this
+    /// reopens the package: several independent mounts can then decode on different threads (one
+    /// thread per mount). Disposing the mount closes its handle.
     /// </summary>
-    public Stream OpenSharedMount() => OpenMount();
+    public Stream OpenIndependentMount()
+    {
+        EnsureDecoded();
+        if (_decodeError is not null)
+            throw new InvalidDataException($"Package contents could not be decoded: {_decodeError}");
+        if (!_usedFileBacked) return new MemoryStream(_decoded!.Mount, writable: false);
+        ProsperoFileBackedPackage package = ReopenFileBacked();
+        try
+        {
+            return new MountLease(package.OpenMount(), package.Dispose);
+        }
+        catch
+        {
+            package.Dispose();
+            throw;
+        }
+    }
 
-    /// <summary>Opens <paramref name="entry"/> over a mount from <see cref="OpenSharedMount"/>; disposing
-    /// the returned stream leaves the shared mount open.</summary>
+    /// <summary>Opens <paramref name="entry"/> over a mount from <see cref="OpenIndependentMount"/>;
+    /// disposing the returned stream leaves that mount open.</summary>
     public Stream OpenInnerFile(ProsperoInnerPfsReader.Entry entry, Stream sharedMount)
     {
         if (entry.IsDirectory) throw new InvalidDataException($"'{entry.Path}' is a directory.");
